@@ -10,7 +10,7 @@ RATE = 24000
 
 def tts(text):
     return b"".join(dg.speak.v1.audio.generate(
-        text=text, model="aura-2-thalia-en", encoding="linear16",
+        text=text, model="aura-2-draco-en", encoding="linear16",
         container="none", sample_rate=RATE))
 
 def test_pause_splits_lines():
@@ -52,12 +52,12 @@ def test_tts_streams_immediately():
     stream must be raw PCM (no wav header) in whole 16-bit frames."""
     text = ("Hey Marcus, this is a long enough sentence that waiting for the whole "
             "thing would be obvious to anyone listening to it.")
-    next(iter(dg.speak.v1.audio.generate(text="warm up", model="aura-2-thalia-en",
+    next(iter(dg.speak.v1.audio.generate(text="warm up", model="aura-2-draco-en",
         encoding="linear16", container="none", sample_rate=RATE)))   # pay TLS setup first
 
     t0 = time.time()
     first_at, first_chunk, total = None, None, 0
-    for chunk in dg.speak.v1.audio.generate(text=text, model="aura-2-thalia-en",
+    for chunk in dg.speak.v1.audio.generate(text=text, model="aura-2-draco-en",
             encoding="linear16", container="none", sample_rate=RATE):
         if first_at is None:
             first_at, first_chunk = time.time() - t0, chunk
