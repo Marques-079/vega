@@ -2,10 +2,12 @@
 
 Text and voice share one `history`, so what you typed is still there when you
 switch to voice and back. The voice loop is lifted straight from R&D/conversation.ipynb.
+Everything VEGA can do beyond talking lives in tools/ - see tools/__init__.py.
 """
-import os, re, json, sys, time, queue, threading, contextlib, subprocess, httpx
+import os, re, json, sys, time, queue, threading, contextlib, httpx
 from dotenv import load_dotenv
 import ui as _ui
+import tools as toolbox
 
 load_dotenv()
 LLM = httpx.Client(base_url="https://api.cerebras.ai/v1", timeout=30,
@@ -14,30 +16,30 @@ LLM = httpx.Client(base_url="https://api.cerebras.ai/v1", timeout=30,
 MODEL = "gpt-oss-120b"
 VOICE, SPEED = "aura-2-jupiter-en", 1.2
 TTS_RATES = (8000, 16000, 24000, 32000, 48000)   # linear16 rates Deepgram can emit
-KEYTERMS = ["Vega", "Kubernetes", "Priya", "Postgres", "standup"]
+KEYTERMS = ["Vega", "Kubernetes", "Priya", "Postgres", "standup", "overlay"]
 WAKE = re.compile(r"\bvega\b", re.I)   # says it mid-answer and it cuts itself off
 IDLE_TIMEOUT = 120                      # seconds of no speech before the socket hangs up
 MUTE_TAIL = 0.25                        # mic stays deaf this long after it stops talking
 
+# Shared tail of both system prompts: when to reach for the internet.
+ROUTE = (" Your knowledge has a training cutoff and today is past it. For recent "
+         "events, news, weather, prices, or anything needing live web data or "
+         "actions, call SINGLE_SEARCH_HAIKU rather than answering from memory.")
 TYPED = ("You are Vega, Marcus's assistant. Answer in a few short sentences. "
-         "Plain text, no headings or bullets.")
+         "Plain text, no headings or bullets.") + ROUTE
 SPOKEN = ("Respond shortly. You are a voice assistant and your reply is read aloud: "
           "answer in one or two plain spoken sentences. Never use markdown, lists, "
-          "bullets, asterisks, headings, or emoji. Write numbers and units as words.")
+          "bullets, asterisks, headings, or emoji. Write numbers and units as "
+          "words.") + ROUTE
 
-# Rides along on every Cerebras call, like a second system prompt.
-TOOLS = [{"type": "function", "function": {
-    "name": "internet_lookup",
-    "description": "Look something up on the live internet - news, weather, prices, "
-                   "anything you don't know or that may have changed. Slow: the answer "
-                   "arrives later on its own, so acknowledge briefly and stop.",
-    "parameters": {"type": "object", "properties": {
-        "query": {"type": "string", "description": "what to find out, as one full question"}},
-        "required": ["query"]}}}]
+# Rides along on every Cerebras call, like a second system prompt. The tools
+# themselves live in tools/ - one module each, see tools/__init__.py.
+TOOLS = toolbox.SPECS
 
 history = [{"role": "system", "content": TYPED}]
 speak_q = queue.Queue()               # late answers; delivered only when the floor is free
 _speak = {"fn": None, "free": None}   # the live voice session registers its speaker here
+APP = None                            # set at startup; the tools' window into the UI
 
 
 def after_name(txt):
@@ -51,8 +53,10 @@ def after_name(txt):
 
 def stream(msg, spoken):
     """Yield Cerebras tokens for `msg`. Same history either way, only the system
-    prompt swaps - typed answers may use punctuation a voice would trip over."""
-    history[0]["content"] = SPOKEN if spoken else TYPED
+    prompt swaps - typed answers may use punctuation a voice would trip over.
+    Whatever is running in the background rides along on every call, so the model
+    always knows what it is waiting on and what it could cancel."""
+    history[0]["content"] = (SPOKEN if spoken else TYPED) + toolbox.status()
     history.append({"role": "user", "content": msg})
     answer, why, tool = "", None, {"id": "", "name": "", "args": ""}
     with LLM.stream("POST", "/chat/completions", json={
@@ -83,19 +87,18 @@ def stream(msg, spoken):
                 yield tok
     if why == "tool_calls" and tool["name"]:
         try:
-            ask = json.loads(tool["args"]).get("query") or tool["args"]
+            args = json.loads(tool["args"])
         except ValueError:
-            ask = tool["args"]
+            args = {}
+        if not isinstance(args, dict):
+            args = {"query": str(args)}
+        # The turn verbatim, attached by the harness: gpt-oss paraphrases whatever
+        # it copies into arguments, and no description talks it out of that.
+        args["_user"] = msg
         if not answer:
-            answer = "One moment, sir - looking that up."
+            answer = "One moment, sir."
             yield answer
-        # The lookup runs on a snapshot: shared history never carries tool messages,
-        # so a question asked while one is in flight can't wedge into its turn order.
-        snap = [{**history[0]}, *history[1:],
-                {"role": "assistant", "content": answer, "tool_calls": [
-                    {"id": tool["id"] or "call_0", "type": "function",
-                     "function": {"name": tool["name"], "arguments": tool["args"]}}]}]
-        threading.Thread(target=_lookup, args=(ask, tool["id"] or "call_0", snap),
+        threading.Thread(target=_run_tool, args=(tool["name"], args),
                          daemon=True).start()
     if answer:
         history.append({"role": "assistant", "content": answer})
@@ -105,30 +108,19 @@ def stream(msg, spoken):
         yield "[cut off - raise max_completion_tokens]"
 
 
-def _lookup(ask, call_id, msgs):
-    """The internet tool: claude CLI does the searching, what it found goes back
-    through Cerebras with the conversation attached, and the answer waits in
-    speak_q for a free floor instead of cutting in."""
+def _run_tool(name, args):
+    """One tool call, off the main thread. Whatever the tool returns IS the answer -
+    no second pass through Cerebras, whose tool-result turns leaked reasoning into
+    the reply - and it waits in speak_q for a free floor instead of cutting in."""
     try:
-        r = subprocess.run(
-            ["claude", "-p", "--allowedTools", "WebSearch,WebFetch",
-             f"Look this up on the internet and answer in under eighty words of "
-             f"plain text: {ask}"],
-            capture_output=True, text=True, timeout=180)
-        found = (r.stdout.strip() or r.stderr.strip())[:4000] or "nothing came back"
+        found = toolbox.run(name, args, APP)
     except Exception as e:
-        found = f"lookup failed: {e}"
-    msgs.append({"role": "tool", "tool_call_id": call_id, "content": found})
-    try:            # no tools on this pass: one lookup per question, no loops
-        r = LLM.post("/chat/completions", json={
-            "model": MODEL, "messages": msgs, "reasoning_effort": "low",
-            "max_completion_tokens": 400, "temperature": 0.6})
-        answer = (r.json()["choices"][0]["message"]["content"] or "").strip()
-    except Exception as e:
-        answer = f"The lookup finished but I couldn't read it, sir. {e}"
-    if answer:
-        history.append({"role": "assistant", "content": answer})
-        speak_q.put(answer)
+        found = f"{name} failed: {e}"
+    if found is None:
+        return          # cancelled mid-flight; cancel_task already gave the answer
+    found = str(found).strip()[:4000] or "nothing came back"
+    history.append({"role": "assistant", "content": found})
+    speak_q.put(found)
 
 
 def _speaker(ui):
@@ -144,6 +136,8 @@ def _speaker(ui):
         except Exception:
             ui.say(text)                # voice session died mid-handoff
 
+
+def best_audio(mic=False):
     """Device name the voice session should use, or None for the system default.
     Output: bluetooth headphones, then wired externals, then the built-in speakers -
     the closer the sound sits to your ears, the less of it comes back through the mic.
@@ -208,6 +202,10 @@ def on_text(ui, msg):
 
 # --------------------------------------------------------------- voice mode
 _stop, _voice_running = threading.Event(), threading.Event()
+# The output stream outlives the voice session: joining and leaving a bluetooth
+# device makes its link re-buffer, which anything else playing feels as a glitch.
+# Kept open, Vega is one permanent client that is simply silent between sessions.
+_out = {"key": None, "s": None}
 
 def _prewarm():
     """The imports and PortAudio's first device query cost about a second between
@@ -296,9 +294,14 @@ def _voice(ui):
 
             # Two TLS handshakes, one after the other, is most of the wait before it
             # hears you. They have nothing to say to each other, so dial both at once.
+            # Flux ends turns on confidence, not a silence timer. eot_threshold is the
+            # eagerness dial: 0.5 treated a thinking pause as a finished turn; 0.7 (the
+            # Deepgram default) waits until it sounds finished. eot_timeout_ms is the
+            # hard cap that cuts in anyway after that much silence - the extra second
+            # only costs latency when you genuinely trail off mid-sentence.
             stt_cm = dg.listen.v2.connect(
                 model="flux-general-en", encoding="linear16", sample_rate=rate,
-                eager_eot_threshold=0.3, eot_threshold=0.5, eot_timeout_ms=2000,
+                eager_eot_threshold=0.3, eot_threshold=0.7, eot_timeout_ms=3000,
                 keyterm=KEYTERMS)
             tts_cm = dg.speak.v1.connect(
                 model=VOICE, encoding="linear16", sample_rate=tts_rate, speed=SPEED)
@@ -311,11 +314,15 @@ def _voice(ui):
             # buffer underruns between Deepgram chunks - the crackle inside its own
             # speech. The cost is a beat more residual audio after a barge-in cut.
             ui.dev(f"-- OUT   {sink['name']} @ {tts_rate}")
-            out = sd.RawOutputStream(samplerate=tts_rate, channels=1, dtype="int16",
-                                     latency="high", device=spk)
-            out.start()
-            stack.callback(out.close)
-            stack.callback(out.abort)
+            if _out["key"] != (spk, tts_rate):      # sink changed under us; swap streams
+                with contextlib.suppress(Exception):
+                    if _out["s"]:
+                        _out["s"].close()
+                o = sd.RawOutputStream(samplerate=tts_rate, channels=1, dtype="int16",
+                                       latency="high", device=spk)
+                o.start()
+                _out.update(key=(spk, tts_rate), s=o)
+            out = _out["s"]
 
             ring.join()                     # whichever failed, the other still has a
             for cm, key in ((stt_cm, "stt"), (tts_cm, "tts")):   # socket open to close
@@ -425,10 +432,17 @@ def _voice(ui):
             threading.Thread(target=watchdog, daemon=True).start()
 
             try:
+                upd_n, upd_txt = 0, None        # run length of unchanged Update events
                 for m in stt:
                     txt = (getattr(m, "transcript", "") or "").strip()
                     ev = getattr(m, "event", None) or getattr(m, "type", "") or ""
-                    ui.dev(f"{ev:<12} {txt}".rstrip())
+                    if ev == "Update":          # a quiet mic Updates every second; three
+                        upd_n = upd_n + 1 if txt == upd_txt else 1   # in a row is enough
+                        upd_txt = txt           # to see it's alive - new words reset it
+                    else:
+                        upd_n = 0
+                    if upd_n <= 3:
+                        ui.dev(f"{ev:<12} {txt}".rstrip())
                     if txt:
                         st["heard"] = time.time()   # someone's talking; queued answers hold
                     if st["speaking"]:
@@ -451,6 +465,13 @@ def _voice(ui):
                         ui.dev("-- CUT   name heard mid-answer")
                         with contextlib.suppress(Exception):
                             tts.send_clear()            # drop what Deepgram queued
+                        with contextlib.suppress(Exception):
+                            # latency="high" buffers seconds of audio locally, and
+                            # send_clear can't reach it - abort is the only thing
+                            # that makes "stop" mean now. The restart may blip a
+                            # bluetooth link, but only ever on a barge-in.
+                            out.abort()
+                            out.start()
                         # then fall through: this same turn may carry the question
                     if getattr(m, "event", None) == "EndOfTurn":
                         barged, st["barged"] = st["barged"], False
@@ -492,7 +513,7 @@ def _voice(ui):
 
 
 if __name__ == "__main__":
-    app = _ui.Vega(dev="-dev" in sys.argv)
+    app = APP = _ui.Vega(dev="-dev" in sys.argv)
     app.on_text = lambda t: on_text(app, t)
     app.on_talk = lambda on: on_talk(app, on)
     threading.Thread(target=_speaker, args=(app,), daemon=True).start()

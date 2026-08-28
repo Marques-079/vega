@@ -1,2 +1,4 @@
 .env
 voice_samples/
+__pycache__/
+env/
