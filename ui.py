@@ -158,20 +158,35 @@ class Vega(tk.Tk):
         # Sized from the text rather than fixed, so the pill still fits if macOS
         # substitutes a wider face for SF Mono.
         f = tkfont.Font(font=TAG_FONT)
-        pw, ph = f.measure("VEGA") + 12, f.metrics("linespace") + 5
+        tw, ph = f.measure("VEGA"), f.metrics("linespace") + 5
+        dot = 7                             # the voice toggle, small, right of the word
+        pw = tw + 12 + dot + 5
         self._tag = (pw + 2 * PAD, ph + 2 * PAD)
         self.tag = tk.Canvas(self, width=self._tag[0], height=self._tag[1],
                              bg=self._clear, highlightthickness=0)
         self.plate = _round_rect(self.tag, PAD, PAD, PAD + pw, PAD + ph, ph / 2)
-        self.word = self.tag.create_text(self._tag[0] / 2, self._tag[1] / 2, text="VEGA",
+        self.word = self.tag.create_text(PAD + 6 + tw / 2, self._tag[1] / 2, text="VEGA",
                                          font=TAG_FONT)
-        self._draggable(self.tag, on_click=self.expand)
+        self._dot_x = PAD + 6 + tw + 5
+        y0 = self._tag[1] / 2 - dot / 2
+        self.dot = self.tag.create_oval(self._dot_x, y0, self._dot_x + dot, y0 + dot,
+                                        outline="")
+        self._draggable(self.tag)
+        self.tag.bind("<ButtonRelease-1>", self._tag_click)
+
+    def _tag_click(self, e):
+        """The dot toggles voice without opening the panel; anywhere else expands."""
+        if not self._moved:
+            self.toggle_talk() if e.x >= self._dot_x - 3 else self.expand()
 
     def _paint_tag(self, unread=False):
         p, live = self.pal, self.talking
         self.tag.itemconfig(self.plate, fill=p["accent"] if live else p["bg"],
                             outline=p["accent"] if (live or unread) else p["ember"])
         self.tag.itemconfig(self.word, fill=p["bg"] if live else p["accent"])
+        # Grey when off; lit when on - inverted like the word, because the whole
+        # plate is already accent-colored while voice is live.
+        self.tag.itemconfig(self.dot, fill=p["bg"] if live else p["dim"])
 
     # ---------- panel ----------
     def _build_panel(self):
